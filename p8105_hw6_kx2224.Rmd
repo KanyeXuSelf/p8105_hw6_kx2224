@@ -1,0 +1,268 @@
+---
+title: "p8105_hw6_kx2224"
+author: "Kangyu Xu (kx2224)"
+date: "2024-12-02"
+output: github_document
+---
+
+```{r}
+library(tidyverse)
+library(modelr)
+library(p8105.datasets)
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+```
+
+
+
+## Problem 1
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+
+head(weather_df)
+```
+```{r}
+# Define a function to compute bootstrap estimates
+bootstrap_estimates <- function(data, n_bootstrap = 5000) {
+  set.seed(123) # For reproducibility
+  
+  bootstrap_results <- replicate(n_bootstrap, {
+    # Sample data with replacement
+    boot_sample <- data %>% sample_frac(replace = TRUE)
+    
+    # Fit a linear model
+    model <- lm(tmax ~ tmin, data = boot_sample)
+    
+    # Extract r-squared and log(beta0 * beta1)
+    r_squared <- summary(model)$r.squared  # 手动计算 R²
+    model_coefs <- broom::tidy(model)
+    log_beta0_beta1 <- log(abs(model_coefs$estimate[1] * model_coefs$estimate[2]))
+    
+    # Return estimates
+    c(r_squared = r_squared, log_beta0_beta1 = log_beta0_beta1)
+  })
+  
+  # Convert results to a data frame
+  results_df <- as.data.frame(t(bootstrap_results))
+  colnames(results_df) <- c("r_squared", "log_beta0_beta1")
+  return(results_df)
+}
+
+# Perform bootstrap analysis on the provided data
+bootstrap_results <- bootstrap_estimates(weather_df)
+
+# Plot the distributions
+ggplot(bootstrap_results, aes(x = log_beta0_beta1)) +
+  geom_density(fill = "green", alpha = 0.5) +
+  labs(title = "Bootstrap Distributions", subtitle = "log(β₀ * β₁)", x = "Value", y = "Density") +
+  theme_minimal()
+
+ggplot(bootstrap_results, aes(x = r_squared)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  labs(title = "Bootstrap Distributions", subtitle = "R²", x = "Value", y = "Density") +
+  theme_minimal()
+```
+
+```{r}
+# Compute 95% confidence intervals
+ci_r_squared <- quantile(bootstrap_results$r_squared, c(0.025, 0.975))
+ci_log_beta0_beta1 <- quantile(bootstrap_results$log_beta0_beta1, c(0.025, 0.975))
+
+# Print confidence intervals
+cat("95% Confidence Interval for R-squared:\n")
+print(ci_r_squared)
+cat("\n95% Confidence Interval for log(beta0 * beta1):\n")
+print(ci_log_beta0_beta1)
+```
+### Bootstrap Results
+
+The calculated  95% CI of **R²** ：
+
+`r paste0("[", round(ci_r_squared[1], 3), ", ", round(ci_r_squared[2], 3), "]")`
+
+The calculated  95% CI of **log(β₀ * β₁)** ：
+
+`r paste0("[", round(ci_log_beta0_beta1[1], 3), ", ", round(ci_log_beta0_beta1[2], 3), "]")`
+
+
+## Problem 2
+```{r}
+homicide_df <- read_csv("https://raw.githubusercontent.com/washingtonpost/data-homicides/master/homicide-data.csv") 
+
+homicide_df = homicide_df |>
+  mutate(city_state = paste(city, state, sep = ", "),
+         status = if_else(disposition == "Closed by arrest", 1, 0)
+           ) |>  
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("White", "Black"),
+    victim_age != "Unknown") |>
+  mutate(victim_age = as.numeric(victim_age)) |>
+  select(-city, - state, -disposition)
+```
+```{r}
+head(homicide_df)
+```
+### Logistic Regression for Baltimore
+
+```{r}
+baltimore_data <- homicide_df %>% filter(city_state == "Baltimore, MD")
+
+baltimore_glm <- glm(status ~ victim_age + victim_sex + victim_race, 
+                     data = baltimore_data, family = "binomial")
+
+baltimore_summary <- broom::tidy(baltimore_glm, conf.int = TRUE)
+print(baltimore_summary)
+```
+### Logistic Regression for All Cities
+
+```{r}
+# Fit logistic regression models for each city
+city_results <- homicide_df %>%
+  group_by(city_state) %>%
+  nest() %>%
+  mutate(glm_model = map(data, ~ glm(status ~ victim_age + victim_sex + victim_race, 
+                                     data = ., family = "binomial")),
+         glm_tidy = map(glm_model, ~ broom::tidy(., conf.int = TRUE))) %>%
+  select(city_state, glm_tidy) %>%
+  unnest(cols = glm_tidy)
+
+odds_ratios <- city_results %>%
+  filter(term == "victim_sexMale") %>%
+  mutate(OR = exp(estimate),
+         lower_CI = exp(conf.low),
+         upper_CI = exp(conf.high)) %>%
+  select(city_state, OR, lower_CI, upper_CI)
+
+print(odds_ratios)
+```
+ 
+
+
+```{r}
+# Plot odds ratios and confidence intervals by city
+ggplot(odds_ratios, aes(x = reorder(city_state, OR), y = OR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Estimated Odds Ratios for Male vs Female Victims by City",
+    x = "City",
+    y = "Odds Ratio (Male vs Female)"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+## Problem 3
+
+```{r}
+bw_df = read_csv("https://p8105.com/data/birthweight.csv") |>
+  mutate(
+      babysex = recode_factor(babysex, `1` = "Male", `2` = "Female"), 
+      frace = recode_factor(frace, `1` = "White", `2` = "Black", `3` = "Asian", 
+                                   `4` = "Puerto Rican", `8` = "Other", `9` = "Unknown"),
+      mrace = recode_factor(mrace, `1` = "White", `2` = "Black", `3` = "Asian", 
+                                   `4` = "Puerto Rican", `8` = "Other"), 
+      malform = recode_factor(malform, `0` = "Absent", `1` = "Present"), 
+  )%>%
+  drop_na()
+```
+```{r}
+sapply(bw_df, function(x) sum(is.na(x)))
+```
+
+
+
+### First model regression 
+```{r}
+fit_hypothetical <- gam(bwt ~ s(ppwt) + s(gaweeks), data = bw_df)
+
+```
+
+```{r}
+bw_df <- bw_df %>%
+  add_predictions(fit_hypothetical) %>%
+  add_residuals(fit_hypothetical)
+
+bw_df %>%
+  ggplot(aes(x = gaweeks, y = resid)) +
+  geom_point() +
+  labs(
+    x = "Gestational Age",
+    y = "Residuals",
+    title = "Residuals vs Gestational Age"
+  ) +
+  theme_minimal()
+```
+### Cross Validation
+```{r}
+set.seed(123)
+
+# Create cross-validation dataset
+cv_df <- crossv_mc(bw_df, 100) %>%
+  mutate(
+    train = map(train, as_tibble),  # Convert training sets to tibbles
+    test = map(test, as_tibble)    # Convert testing sets to tibbles
+  )
+
+# Fit models for cross-validation
+cv_results <- cv_df %>%
+  mutate(
+    # Model 1: Hypothetical model using GAM
+    model_1 = map(train, ~ gam(bwt ~ s(ppwt) + s(gaweeks), data = .x)),
+    # Model 2: Simple linear model
+    model_2 = map(train, ~ lm(bwt ~ blength + gaweeks, data = .x)),
+    # Model 3: Linear model with interaction terms
+    model_3 = map(train, ~ lm(bwt ~ bhead * blength * babysex, data = .x))
+  ) %>%
+  mutate(
+    # Calculate RMSE for each model on the test set
+    rmse_model_2 = map2_dbl(model_2, test, ~ rmse(model = .x, data = .y)),
+    rmse_model_3 = map2_dbl(model_3, test, ~ rmse(model = .x, data = .y)),
+    rmse_model_1 = map2_dbl(model_1, test, ~ rmse(model = .x, data = .y))
+  )
+```
+
+```{r}
+# Reshape and visualize RMSE comparison
+cv_results %>%
+  select(starts_with("rmse")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "model",
+    values_to = "rmse",
+    names_prefix = "rmse_model_"
+  ) %>%
+  mutate(model = fct_inorder(model)) %>%
+  ggplot(aes(x = model, y = rmse)) +
+  geom_violin(trim = FALSE, fill = "lightblue") +  # Add violin plot
+  geom_boxplot(width = 0.1, color = "black", alpha = 0.7) +  # Add boxplot
+  labs(
+    title = "Cross-Validated RMSE Comparison",
+    x = "Model",
+    y = "Root Mean Square Error (RMSE)"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5)  # Center-align the title
+  )
+
+```
+
+
+
